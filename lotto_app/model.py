@@ -12,17 +12,14 @@ GRID_ROWS = {
     row: ((row + 6) % 10, (row + 2) % 10, (row - 1) % 10)
     for row in range(1, 11)
 }
-
+TIER_PRIORITY = {"tier1": 1, "tier2": 2, "tier3": 3, "tier4": 4}
 BASE_TIER_SCORES = {
     "tier1": 100.0,
-    "tier2": 70.0,
-    "tier3": 40.0,
-    "tier4": 25.0,
+    "tier2": 68.0,
+    "tier3": 36.0,
+    "tier4": 18.0,
 }
-RECENCY_MULTIPLIERS = {
-    "latest": 1.0,
-    "previous": 0.65,
-}
+RECENCY_WEIGHTS = [1.0, 0.62, 0.34, 0.18, 0.1]
 
 
 @dataclass(frozen=True)
@@ -51,10 +48,13 @@ class WinnerAnalysis:
 @dataclass(frozen=True)
 class PredictionCandidate:
     combo: tuple[int, int, int]
-    score: float
+    total_score: float
+    core_score: float
+    history_score: float
     confidence: str
     support: tuple[str, ...]
     sources: tuple[str, ...]
+    best_tier: str
 
     @property
     def combo_label(self) -> str:
@@ -119,13 +119,7 @@ def analyze_winner(digits: tuple[int, int, int], draw_type: str, label: str) -> 
         sorted(set(cluster_digits) | set(zone_digits_plus_1) | set(zone_digits_plus_2))
     )
     pair_extended_digits = tuple(
-        sorted(
-            {
-                pair_of(digit)
-            for digit in combined_zone_digits
-            if pair_of(digit) not in combined_zone_digits
-            }
-        )
+        sorted({pair_of(digit) for digit in combined_zone_digits if pair_of(digit) not in combined_zone_digits})
     )
     double_pairs_in_zone = tuple(
         sorted(
@@ -192,23 +186,26 @@ def _next_row(row: int) -> int:
     return 1 if row == 10 else row + 1
 
 
-def build_candidates(analysis: WinnerAnalysis, recency: str) -> dict[tuple[int, int, int], dict[str, object]]:
+def build_candidates(analysis: WinnerAnalysis, recency_weight: float) -> dict[tuple[int, int, int], dict[str, object]]:
     pool = set(analysis.combined_zone_digits) | set(analysis.pair_extended_digits)
     candidate_map: dict[tuple[int, int, int], dict[str, object]] = {}
 
     def register(combo: tuple[int, int, int], tier: str, support: str) -> None:
         existing = candidate_map.get(combo)
-        score = BASE_TIER_SCORES[tier] * RECENCY_MULTIPLIERS[recency]
-        if existing is None or existing["score"] < score:
+        weighted_score = BASE_TIER_SCORES[tier] * recency_weight
+        if existing is None:
             candidate_map[combo] = {
-                "score": score,
-                "tier": tier,
+                "core_score": weighted_score,
                 "supports": {support},
                 "sources": {analysis.label},
+                "tiers": {tier},
             }
-        else:
-            existing["supports"].add(support)
-            existing["sources"].add(analysis.label)
+            return
+
+        existing["core_score"] += weighted_score
+        existing["supports"].add(support)
+        existing["sources"].add(analysis.label)
+        existing["tiers"].add(tier)
 
     for combo in analysis.cluster_row_combos:
         register(canonical_combo(combo), "tier1", f"{analysis.label}:cluster-row")
@@ -244,77 +241,140 @@ def predict_next(
     draw_type: str,
     history_depth: int = 20,
     top_n: int = 18,
+    winners_to_use: int = 3,
+    include_hit_rates: bool = True,
 ) -> dict[str, object]:
-    frame = records[records["draw_type"] == draw_type.lower()].copy()
+    frame = records[records["draw_type"] == draw_type.lower()].copy().reset_index(drop=True)
+    winners_to_use = max(2, min(winners_to_use, 5))
     if len(frame) < 2:
         raise ValueError(f"Need at least two {draw_type} results to predict the next draw.")
 
-    latest_two = frame.head(2).reset_index(drop=True)
-    analyses = [
-        analyze_winner(tuple(int(part) for part in latest_two.iloc[0]["number"].split("-")), draw_type, "latest"),
-        analyze_winner(tuple(int(part) for part in latest_two.iloc[1]["number"].split("-")), draw_type, "previous"),
-    ]
+    analyses = _build_analyses(frame, draw_type, winners_to_use)
+    combined = _combine_core_scores(analyses)
 
-    combined: dict[tuple[int, int, int], dict[str, object]] = {}
-    for analysis in analyses:
-        for combo, payload in build_candidates(analysis, analysis.label).items():
-            current = combined.setdefault(
-                combo,
-                {"score": 0.0, "supports": set(), "sources": set(), "tiers": []},
-            )
-            current["score"] += float(payload["score"])
-            current["supports"].update(payload["supports"])
-            current["sources"].update(payload["sources"])
-            current["tiers"].append(payload["tier"])
-
+    core_only_snapshot = {
+        combo: payload["core_score"]
+        for combo, payload in combined.items()
+    }
     _apply_overlap_bonus(combined, analyses)
-    _apply_history_tiebreaker(combined, frame.iloc[2 : 2 + history_depth])
+    _apply_history_tiebreaker(combined, frame.iloc[winners_to_use : winners_to_use + history_depth])
 
     candidates = [
         PredictionCandidate(
             combo=combo,
-            score=round(payload["score"], 2),
-            confidence=_confidence_from_score(float(payload["score"])),
+            total_score=round(payload["core_score"] + payload["history_score"], 2),
+            core_score=round(payload["core_score"], 2),
+            history_score=round(payload["history_score"], 2),
+            confidence=_confidence_from_score(float(payload["core_score"] + payload["history_score"])),
             support=tuple(sorted(payload["supports"])),
             sources=tuple(sorted(payload["sources"])),
+            best_tier=min(payload["tiers"], key=lambda item: TIER_PRIORITY[item]),
         )
         for combo, payload in combined.items()
     ]
-    candidates.sort(key=lambda item: (-item.score, item.combo))
+    candidates.sort(key=lambda item: (-item.total_score, -item.core_score, item.combo))
 
+    hit_rates = (
+        backtest_hit_rates(records, draw_type=draw_type, winners_to_use=winners_to_use, history_depth=history_depth, top_n=top_n)
+        if include_hit_rates else None
+    )
+
+    dataset_freshness_days = _dataset_gap_days(frame)
     return {
         "draw_type": draw_type.upper(),
-        "latest_two": latest_two,
+        "latest_inputs": frame.head(winners_to_use).copy(),
         "analyses": analyses,
         "top_candidates": candidates[:top_n],
         "all_candidates": candidates,
+        "core_score_snapshot": core_only_snapshot,
+        "hit_rates": hit_rates,
+        "dataset_freshness_days": dataset_freshness_days,
     }
+
+
+def _build_analyses(frame: pd.DataFrame, draw_type: str, winners_to_use: int) -> list[WinnerAnalysis]:
+    analyses: list[WinnerAnalysis] = []
+    recent = frame.head(winners_to_use).reset_index(drop=True)
+    for index, row in recent.iterrows():
+        digits = tuple(int(part) for part in str(row["number"]).split("-"))
+        label = "latest" if index == 0 else "previous" if index == 1 else f"older-{index + 1}"
+        analyses.append(analyze_winner(digits, draw_type, label))
+    return analyses
+
+
+def _combine_core_scores(analyses: list[WinnerAnalysis]) -> dict[tuple[int, int, int], dict[str, object]]:
+    combined: dict[tuple[int, int, int], dict[str, object]] = {}
+    for index, analysis in enumerate(analyses):
+        recency_weight = RECENCY_WEIGHTS[min(index, len(RECENCY_WEIGHTS) - 1)]
+        for combo, payload in build_candidates(analysis, recency_weight).items():
+            current = combined.setdefault(
+                combo,
+                {
+                    "core_score": 0.0,
+                    "history_score": 0.0,
+                    "supports": set(),
+                    "sources": set(),
+                    "tiers": set(),
+                },
+            )
+            current["core_score"] += float(payload["core_score"])
+            current["supports"].update(payload["supports"])
+            current["sources"].update(payload["sources"])
+            current["tiers"].update(payload["tiers"])
+    return combined
 
 
 def _apply_overlap_bonus(
     combined: dict[tuple[int, int, int], dict[str, object]],
     analyses: list[WinnerAnalysis],
 ) -> None:
-    latest_pool = set(analyses[0].combined_zone_digits) | set(analyses[0].pair_extended_digits)
-    previous_pool = set(analyses[1].combined_zone_digits) | set(analyses[1].pair_extended_digits)
+    if len(analyses) < 2:
+        return
 
-    latest_rows = {canonical_combo(combo) for combo in analyses[0].cluster_row_combos + analyses[0].zone_row_combos_plus_1}
-    previous_rows = {canonical_combo(combo) for combo in analyses[1].cluster_row_combos + analyses[1].zone_row_combos_plus_1}
+    primary = analyses[0]
+    secondary = analyses[1]
+    primary_pool = set(primary.combined_zone_digits) | set(primary.pair_extended_digits)
+    secondary_pool = set(secondary.combined_zone_digits) | set(secondary.pair_extended_digits)
+
+    primary_rows = {
+        canonical_combo(combo)
+        for combo in primary.cluster_row_combos + primary.zone_row_combos_plus_1
+    }
+    secondary_rows = {
+        canonical_combo(combo)
+        for combo in secondary.cluster_row_combos + secondary.zone_row_combos_plus_1
+    }
+    overlap_rows = primary_rows.intersection(secondary_rows)
+    overlap_digits = primary_pool.intersection(secondary_pool)
 
     for combo, payload in combined.items():
         combo_set = set(combo)
-        if combo in latest_rows and combo in previous_rows:
-            payload["score"] += 55
-            payload["supports"].add("shared-row-signal")
-        if combo_set.issubset(latest_pool.intersection(previous_pool)):
-            payload["score"] += 25
-            payload["supports"].add("shared-digit-pool")
-        if any(digit in analyses[0].last_winner for digit in combo):
-            payload["score"] += 8
+        bonus = 0.0
+        if combo in overlap_rows:
+            bonus += 45.0
+            payload["supports"].add("latest+previous-row-overlap")
+        if combo_set.issubset(overlap_digits):
+            bonus += 22.0
+            payload["supports"].add("latest+previous-digit-overlap")
+        if any(digit in primary.last_winner for digit in combo):
+            bonus += 10.0
             payload["supports"].add("latest-winner-recurrence")
-        if any(digit in analyses[1].last_winner for digit in combo):
-            payload["score"] += 4
+        if any(digit in secondary.last_winner for digit in combo):
+            bonus += 5.0
             payload["supports"].add("previous-winner-recurrence")
+        payload["core_score"] += bonus
+
+    if len(analyses) <= 2:
+        return
+
+    for extra_index, analysis in enumerate(analyses[2:], start=2):
+        extra_pool = set(analysis.combined_zone_digits) | set(analysis.pair_extended_digits)
+        overlap_with_primary = primary_pool.intersection(extra_pool)
+        decay_bonus = 8.0 / extra_index
+        for combo, payload in combined.items():
+            if set(combo).issubset(overlap_with_primary):
+                payload["core_score"] += decay_bonus
+                payload["supports"].add(f"{analysis.label}-digit-overlap")
 
 
 def _apply_history_tiebreaker(
@@ -331,8 +391,8 @@ def _apply_history_tiebreaker(
         for digit in digits:
             digit_frequency[digit] += 1
         for left, right in combinations(sorted(set(digits)), 2):
-            key = (left, right)
-            pair_frequency[key] = pair_frequency.get(key, 0) + 1
+            pair = (left, right)
+            pair_frequency[pair] = pair_frequency.get(pair, 0) + 1
 
     max_digit = max(digit_frequency.values()) or 1
     max_pair = max(pair_frequency.values()) if pair_frequency else 1
@@ -343,14 +403,82 @@ def _apply_history_tiebreaker(
             pair_frequency.get(pair, 0) / max_pair
             for pair in combinations(sorted(set(combo)), 2)
         )
-        payload["score"] += round((digit_score * 2.5) + (pair_score * 1.5), 2)
+        history_score = round((digit_score * 1.75) + (pair_score * 1.0), 2)
+        payload["history_score"] += history_score
         payload["supports"].add("recent-history-tiebreaker")
 
 
+def backtest_hit_rates(
+    records: pd.DataFrame,
+    draw_type: str,
+    winners_to_use: int = 3,
+    history_depth: int = 20,
+    top_n: int = 18,
+    lookback_predictions: int = 60,
+) -> dict[str, object]:
+    frame = records[records["draw_type"] == draw_type.lower()].copy().reset_index(drop=True)
+    if len(frame) <= winners_to_use:
+        return {"sample_size": 0, "top_n_hit_rate": 0.0, "tier_hit_rates": {}, "direct_tier_hits": {}}
+
+    sample_size = 0
+    top_hits = 0
+    tier_hits = {tier: 0 for tier in TIER_PRIORITY}
+    direct_tier_hits = {tier: 0 for tier in TIER_PRIORITY}
+
+    max_target_index = min(len(frame) - winners_to_use, lookback_predictions)
+    for target_index in range(max_target_index):
+        target_number = canonical_combo(int(part) for part in str(frame.iloc[target_index]["number"]).split("-"))
+        prediction_slice = frame.iloc[target_index + 1 :].reset_index(drop=True)
+        if len(prediction_slice) < winners_to_use:
+            continue
+
+        predicted = predict_next(
+            records=prediction_slice,
+            draw_type=draw_type,
+            history_depth=history_depth,
+            top_n=top_n,
+            winners_to_use=winners_to_use,
+            include_hit_rates=False,
+        )
+        ranked = predicted["top_candidates"]
+        all_ranked = predicted["all_candidates"]
+        sample_size += 1
+
+        if any(candidate.combo == target_number for candidate in ranked):
+            top_hits += 1
+
+        for tier in TIER_PRIORITY:
+            tier_candidates = [candidate for candidate in ranked if candidate.best_tier == tier]
+            if any(candidate.combo == target_number for candidate in tier_candidates):
+                tier_hits[tier] += 1
+
+        exact_candidate = next((candidate for candidate in all_ranked if candidate.combo == target_number), None)
+        if exact_candidate is not None:
+            direct_tier_hits[exact_candidate.best_tier] += 1
+
+    return {
+        "sample_size": sample_size,
+        "top_n_hit_rate": round((top_hits / sample_size) * 100, 2) if sample_size else 0.0,
+        "tier_hit_rates": {
+            tier: round((hits / sample_size) * 100, 2) if sample_size else 0.0
+            for tier, hits in tier_hits.items()
+        },
+        "direct_tier_hits": direct_tier_hits,
+    }
+
+
+def _dataset_gap_days(frame: pd.DataFrame) -> int:
+    if frame.empty:
+        return 0
+    latest_date = pd.Timestamp(frame.iloc[0]["draw_date"]).normalize()
+    now = pd.Timestamp.now().normalize()
+    return max(int((now - latest_date).days), 0)
+
+
 def _confidence_from_score(score: float) -> str:
-    if score >= 150:
+    if score >= 170:
         return "High"
-    if score >= 100:
+    if score >= 115:
         return "Medium"
     return "Speculative"
 

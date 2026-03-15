@@ -42,6 +42,7 @@ def main() -> None:
     with st.sidebar:
         st.header("Prediction Setup")
         draw_type = st.selectbox("Draw type", ["midday", "evening"], index=0)
+        winners_to_use = st.slider("Recent winners to use", min_value=2, max_value=5, value=3)
         top_n = st.slider("How many candidates to show", min_value=5, max_value=30, value=18)
         history_depth = st.slider("Recent history tiebreaker depth", min_value=10, max_value=30, value=20)
         st.write(f"Normalized dataset: `{NORMALIZED_EXPORT_PATH}`")
@@ -50,7 +51,7 @@ def main() -> None:
     prediction_tab, add_tab, history_tab = st.tabs(["Predict", "Add Result", "History"])
 
     with prediction_tab:
-        render_prediction(records, draw_type, history_depth, top_n)
+        render_prediction(records, draw_type, history_depth, top_n, winners_to_use)
 
     with add_tab:
         render_add_result(records)
@@ -59,23 +60,45 @@ def main() -> None:
         render_history(records, draw_type)
 
 
-def render_prediction(records: pd.DataFrame, draw_type: str, history_depth: int, top_n: int) -> None:
+def render_prediction(
+    records: pd.DataFrame,
+    draw_type: str,
+    history_depth: int,
+    top_n: int,
+    winners_to_use: int,
+) -> None:
     st.subheader(f"Next {draw_type.title()} Prediction")
     filtered = records[records["draw_type"] == draw_type].copy()
     if len(filtered) < 2:
         st.warning(f"Need at least two {draw_type} results in the dataset.")
         return
 
-    latest_two = filtered.head(2)[["draw_date", "draw_number", "number", "source"]].copy()
-    latest_two["draw_date"] = latest_two["draw_date"].dt.date
-    st.write("Latest two winners used by the model")
-    st.dataframe(latest_two, use_container_width=True, hide_index=True)
+    result = predict_next(
+        records,
+        draw_type=draw_type,
+        history_depth=history_depth,
+        top_n=top_n,
+        winners_to_use=winners_to_use,
+    )
 
-    result = predict_next(records, draw_type=draw_type, history_depth=history_depth, top_n=top_n)
+    latest_inputs = result["latest_inputs"][["draw_date", "draw_number", "number", "source"]].copy()
+    latest_inputs["draw_date"] = latest_inputs["draw_date"].dt.date
+    st.write("Recent winners used by the model")
+    st.dataframe(latest_inputs, use_container_width=True, hide_index=True)
+
+    if result["dataset_freshness_days"] > 3:
+        st.warning(
+            f"Dataset freshness warning: latest {draw_type} result is {result['dataset_freshness_days']} day(s) old. "
+            "Predictions are less reliable when recent draws are missing."
+        )
+
     candidates = pd.DataFrame(
         {
             "combo": [candidate.combo_label for candidate in result["top_candidates"]],
-            "score": [candidate.score for candidate in result["top_candidates"]],
+            "total_score": [candidate.total_score for candidate in result["top_candidates"]],
+            "core_score": [candidate.core_score for candidate in result["top_candidates"]],
+            "history_score": [candidate.history_score for candidate in result["top_candidates"]],
+            "best_tier": [candidate.best_tier for candidate in result["top_candidates"]],
             "confidence": [candidate.confidence for candidate in result["top_candidates"]],
             "source_signal": [", ".join(candidate.sources) for candidate in result["top_candidates"]],
             "why": ["; ".join(candidate.support[:3]) for candidate in result["top_candidates"]],
@@ -84,6 +107,27 @@ def render_prediction(records: pd.DataFrame, draw_type: str, history_depth: int,
 
     st.write("Top candidate bets")
     st.dataframe(candidates, use_container_width=True, hide_index=True)
+
+    hit_rates = result["hit_rates"]
+    if hit_rates and hit_rates["sample_size"] > 0:
+        st.write("Recent backtest snapshot")
+        metric_1, metric_2, metric_3 = st.columns(3)
+        metric_1.metric("Backtest sample", hit_rates["sample_size"])
+        metric_2.metric(f"Top {top_n} hit rate", f"{hit_rates['top_n_hit_rate']}%")
+        strongest_tier = max(hit_rates["tier_hit_rates"], key=hit_rates["tier_hit_rates"].get)
+        metric_3.metric("Best recent tier", f"{strongest_tier} ({hit_rates['tier_hit_rates'][strongest_tier]}%)")
+
+        st.dataframe(
+            pd.DataFrame(
+                {
+                    "tier": list(hit_rates["tier_hit_rates"].keys()),
+                    "hit_rate_percent": list(hit_rates["tier_hit_rates"].values()),
+                    "direct_hits": [hit_rates["direct_tier_hits"][tier] for tier in hit_rates["tier_hit_rates"]],
+                }
+            ),
+            use_container_width=True,
+            hide_index=True,
+        )
 
     for analysis in result["analyses"]:
         with st.expander(f"{analysis.label.title()} winner analysis: {'-'.join(map(str, analysis.last_winner))}"):
