@@ -1,0 +1,1 @@
+"""Lotto prediction app package."""
