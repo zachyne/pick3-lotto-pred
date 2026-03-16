@@ -9,7 +9,10 @@ from lotto_app.data import (
     CUSTOM_RESULTS_PATH,
     NORMALIZED_EXPORT_PATH,
     append_custom_record,
+    delete_custom_record,
+    list_custom_records,
     load_all_records,
+    update_custom_record,
 )
 from lotto_app.model import grid_table, predict_next
 
@@ -196,6 +199,81 @@ def render_add_result(records: pd.DataFrame) -> None:
         recent_manual["draw_date"] = recent_manual["draw_date"].dt.date
         st.write("Recently added manual entries")
         st.dataframe(recent_manual.head(20), use_container_width=True, hide_index=True)
+
+    render_manage_manual_entries()
+
+
+def render_manage_manual_entries() -> None:
+    manual_entries = list_custom_records()
+    if manual_entries.empty:
+        return
+
+    st.divider()
+    st.subheader("Edit or Delete Manual Entry")
+
+    date_options = []
+    date_to_entry_id = {}
+    for row in manual_entries.itertuples(index=False):
+        draw_date = pd.Timestamp(row.draw_date).date()
+        label = str(draw_date)
+        if label in date_to_entry_id:
+            label = f"{draw_date} ({row.draw_type}, #{row.entry_id})"
+        date_options.append(label)
+        date_to_entry_id[label] = int(row.entry_id)
+
+    selected_label = st.selectbox("Select entry date", date_options)
+    selected_entry_id = date_to_entry_id[selected_label]
+    selected_row = manual_entries.loc[manual_entries["entry_id"] == selected_entry_id].iloc[0]
+    selected_draw_number = str(int(selected_row["draw_number"])) if str(selected_row["draw_number"]).strip() else ""
+
+    with st.form("edit-result-form"):
+        edit_draw_type = st.selectbox(
+            "Draw type",
+            ["midday", "evening"],
+            index=0 if selected_row["draw_type"] == "midday" else 1,
+            key="edit_draw_type",
+        )
+        edit_draw_date = st.date_input(
+            "Draw date",
+            value=pd.Timestamp(selected_row["draw_date"]).date(),
+            key="edit_draw_date",
+        )
+        edit_winning_number = st.text_input(
+            "Winning number",
+            value=str(selected_row["number"]),
+            key="edit_winning_number",
+        )
+        edit_draw_number = st.text_input(
+            "Draw number (optional)",
+            value=selected_draw_number,
+            key="edit_draw_number",
+        )
+        save_changes = st.form_submit_button("Save changes")
+
+    if save_changes:
+        try:
+            parsed_draw_number = int(edit_draw_number) if edit_draw_number.strip() else None
+            update_custom_record(
+                entry_id=selected_entry_id,
+                draw_type=edit_draw_type,
+                draw_date=edit_draw_date,
+                winning_number=edit_winning_number,
+                draw_number=parsed_draw_number,
+            )
+            clear_records_cache()
+            st.success("Manual entry updated.")
+            st.rerun()
+        except Exception as exc:
+            st.error(str(exc))
+
+    if st.button("Delete selected entry", type="secondary"):
+        try:
+            delete_custom_record(selected_entry_id)
+            clear_records_cache()
+            st.success("Manual entry deleted.")
+            st.rerun()
+        except Exception as exc:
+            st.error(str(exc))
 
 
 def render_history(records: pd.DataFrame, draw_type: str) -> None:
