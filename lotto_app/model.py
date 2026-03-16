@@ -37,9 +37,11 @@ class WinnerAnalysis:
     cluster_row_combos: tuple[tuple[int, int, int], ...]
     zone_row_combos_plus_1: tuple[tuple[int, int, int], ...]
     zone_row_combos_plus_2: tuple[tuple[int, int, int], ...]
+    coverage_rows: tuple[int, ...]
     cluster_digits: tuple[int, ...]
     zone_digits_plus_1: tuple[int, ...]
     zone_digits_plus_2: tuple[int, ...]
+    coverage_digits: tuple[int, ...]
     combined_zone_digits: tuple[int, ...]
     pair_extended_digits: tuple[int, ...]
     double_pairs_in_zone: tuple[int, ...]
@@ -91,18 +93,7 @@ def derive_grid_equivalent(digits: tuple[int, int, int]) -> tuple[int, int, int]
 def analyze_winner(digits: tuple[int, int, int], draw_type: str, label: str) -> WinnerAnalysis:
     grid_equivalent = derive_grid_equivalent(digits)
     match_digits = set(digits) | set(grid_equivalent)
-
-    row_match_counts = {
-        row: len(match_digits.intersection(GRID_ROWS[row]))
-        for row in GRID_ROWS
-    }
-    anchor_row = min(
-        row for row, score in row_match_counts.items()
-        if score == max(row_match_counts.values())
-    )
-
-    anchor_matches = row_match_counts[anchor_row]
-    companion_row = _choose_companion_row(anchor_row, anchor_matches, match_digits)
+    anchor_row, companion_row = _select_best_cluster(match_digits)
     cluster_rows = _ordered_cluster_rows(anchor_row, companion_row)
     zone_plus_1_rows = (_prev_row(cluster_rows[0]), _next_row(cluster_rows[-1]))
     zone_plus_2_rows = (_prev_row(zone_plus_1_rows[0]), _next_row(zone_plus_1_rows[1]))
@@ -110,10 +101,12 @@ def analyze_winner(digits: tuple[int, int, int], draw_type: str, label: str) -> 
     cluster_row_combos = tuple(GRID_ROWS[row] for row in cluster_rows)
     zone_row_combos_plus_1 = tuple(GRID_ROWS[row] for row in zone_plus_1_rows)
     zone_row_combos_plus_2 = tuple(GRID_ROWS[row] for row in zone_plus_2_rows)
+    coverage_rows = tuple(dict.fromkeys(cluster_rows + zone_plus_1_rows))
 
     cluster_digits = tuple(sorted({digit for combo in cluster_row_combos for digit in combo}))
     zone_digits_plus_1 = tuple(sorted({digit for combo in zone_row_combos_plus_1 for digit in combo}))
     zone_digits_plus_2 = tuple(sorted({digit for combo in zone_row_combos_plus_2 for digit in combo}))
+    coverage_digits = tuple(sorted({digit for row in coverage_rows for digit in GRID_ROWS[row]}))
 
     combined_zone_digits = tuple(
         sorted(set(cluster_digits) | set(zone_digits_plus_1) | set(zone_digits_plus_2))
@@ -142,32 +135,48 @@ def analyze_winner(digits: tuple[int, int, int], draw_type: str, label: str) -> 
         cluster_row_combos=cluster_row_combos,
         zone_row_combos_plus_1=zone_row_combos_plus_1,
         zone_row_combos_plus_2=zone_row_combos_plus_2,
+        coverage_rows=coverage_rows,
         cluster_digits=cluster_digits,
         zone_digits_plus_1=zone_digits_plus_1,
         zone_digits_plus_2=zone_digits_plus_2,
+        coverage_digits=coverage_digits,
         combined_zone_digits=combined_zone_digits,
         pair_extended_digits=pair_extended_digits,
         double_pairs_in_zone=double_pairs_in_zone,
     )
 
 
-def _choose_companion_row(anchor_row: int, anchor_matches: int, match_digits: set[int]) -> int | None:
-    best_row = None
-    best_score = anchor_matches
-    best_start = None
+def _select_best_cluster(match_digits: set[int]) -> tuple[int, int | None]:
+    candidates: list[tuple[tuple[float, float, float, float], int, int | None]] = []
 
-    for row in (_prev_row(anchor_row), _next_row(anchor_row)):
-        combined_score = len(match_digits.intersection(set(GRID_ROWS[anchor_row]) | set(GRID_ROWS[row])))
-        start_row = row if _next_row(row) == anchor_row else anchor_row
-        normalized_start = 0 if start_row == 10 else start_row
-        if combined_score > best_score or (
-            combined_score == best_score and best_row is not None and normalized_start < best_start
-        ):
-            best_row = row
-            best_score = combined_score
-            best_start = normalized_start
+    for row in GRID_ROWS:
+        candidates.append((_cluster_score((row,), match_digits), row, None))
+        candidates.append((_cluster_score((row, _next_row(row)), match_digits), row, _next_row(row)))
 
-    return best_row if best_score > anchor_matches else None
+    _, anchor_row, companion_row = max(candidates, key=lambda item: item[0])
+    return anchor_row, companion_row
+
+
+def _cluster_score(rows: tuple[int, ...], match_digits: set[int]) -> tuple[float, float, float, float]:
+    row_set = set(rows)
+    cluster_digits = {digit for row in row_set for digit in GRID_ROWS[row]}
+    matched_digits = len(match_digits.intersection(cluster_digits))
+
+    center_bonus = sum(_row_center_weight(row) for row in row_set)
+    edge_penalty = sum(1 for row in row_set if row in {1, 10})
+    cluster_size_bonus = 0.2 if len(row_set) == 2 and matched_digits >= 3 else 0.0
+
+    return (
+        float(matched_digits),
+        center_bonus,
+        cluster_size_bonus,
+        -float(edge_penalty),
+    )
+
+
+def _row_center_weight(row: int) -> float:
+    # Rows near the visual middle are preferred when matches are tied.
+    return 10.0 - abs(row - 5.5) * 2.0
 
 
 def _ordered_cluster_rows(anchor_row: int, companion_row: int | None) -> tuple[int, ...]:
@@ -321,7 +330,100 @@ def _combine_core_scores(analyses: list[WinnerAnalysis]) -> dict[tuple[int, int,
             current["supports"].update(payload["supports"])
             current["sources"].update(payload["sources"])
             current["tiers"].update(payload["tiers"])
+    _apply_pattern_completion_bonus(combined, analyses)
+    _apply_coverage_window_bonus(combined, analyses)
     return combined
+
+
+def _apply_pattern_completion_bonus(
+    combined: dict[tuple[int, int, int], dict[str, object]],
+    analyses: list[WinnerAnalysis],
+) -> None:
+    for index, analysis in enumerate(analyses):
+        recency_weight = RECENCY_WEIGHTS[min(index, len(RECENCY_WEIGHTS) - 1)]
+        cluster_pool = set(analysis.cluster_digits)
+        near_pool = set(analysis.zone_digits_plus_1)
+        outer_pool = set(analysis.zone_digits_plus_2)
+        local_pool = cluster_pool | near_pool | outer_pool | set(analysis.pair_extended_digits)
+        center_neighbors = _middle_pattern_digits(analysis)
+
+        for combo, payload in combined.items():
+            combo_set = set(combo)
+            bonus = 0.0
+
+            # All three digits exist inside the same local neighborhood.
+            if combo_set.issubset(local_pool):
+                bonus += 14.0 * recency_weight
+                payload["supports"].add(f"{analysis.label}:local-pattern-complete")
+
+            # Bridge pattern: 2 digits from the cluster + 1 from the nearest supporting rows.
+            cluster_count = len(combo_set.intersection(cluster_pool))
+            near_count = len(combo_set.intersection(near_pool))
+            if cluster_count >= 2 and near_count >= 1:
+                bonus += 20.0 * recency_weight
+                payload["supports"].add(f"{analysis.label}:bridge-combo")
+
+            # Softer bridge: 2 digits from cluster/±1 plus one from ±2.
+            inner_count = len(combo_set.intersection(cluster_pool | near_pool))
+            outer_count = len(combo_set.intersection(outer_pool))
+            if inner_count >= 2 and outer_count >= 1:
+                bonus += 9.0 * recency_weight
+                payload["supports"].add(f"{analysis.label}:outer-bridge")
+
+            # Middle completion: reward the digit that completes the visual center around the cluster.
+            center_count = len(combo_set.intersection(center_neighbors))
+            if center_count >= 1 and inner_count >= 2:
+                bonus += 16.0 * recency_weight
+                payload["supports"].add(f"{analysis.label}:middle-pattern-completion")
+
+            # If the candidate captures all winner digits or their grid-equivalent set nearby, bump it.
+            winner_shape = set(analysis.last_winner) | set(analysis.grid_equivalent)
+            if len(combo_set.intersection(winner_shape)) >= 2 and combo_set.issubset(local_pool):
+                bonus += 8.0 * recency_weight
+                payload["supports"].add(f"{analysis.label}:winner-shape-echo")
+
+            payload["core_score"] += bonus
+
+
+def _apply_coverage_window_bonus(
+    combined: dict[tuple[int, int, int], dict[str, object]],
+    analyses: list[WinnerAnalysis],
+) -> None:
+    for index, analysis in enumerate(analyses):
+        recency_weight = RECENCY_WEIGHTS[min(index, len(RECENCY_WEIGHTS) - 1)]
+        coverage_pool = set(analysis.coverage_digits)
+        cluster_pool = set(analysis.cluster_digits)
+        near_pool = set(analysis.zone_digits_plus_1)
+        outer_pool = set(analysis.zone_digits_plus_2)
+
+        for combo, payload in combined.items():
+            combo_set = set(combo)
+            coverage_count = len(combo_set.intersection(coverage_pool))
+            cluster_count = len(combo_set.intersection(cluster_pool))
+            near_count = len(combo_set.intersection(near_pool))
+            outer_count = len(combo_set.intersection(outer_pool))
+            bonus = 0.0
+
+            if coverage_count == 3:
+                bonus += 18.0 * recency_weight
+                payload["supports"].add(f"{analysis.label}:coverage-retention")
+            elif coverage_count == 2:
+                bonus += 6.0 * recency_weight
+                payload["supports"].add(f"{analysis.label}:partial-coverage")
+
+            if cluster_count >= 1 and near_count >= 2:
+                bonus += 24.0 * recency_weight
+                payload["supports"].add(f"{analysis.label}:anchor-plus-two-supporters")
+            elif cluster_count >= 2 and near_count >= 1:
+                bonus += 16.0 * recency_weight
+                payload["supports"].add(f"{analysis.label}:coverage-concentration")
+
+            # Penalize combos drifting outside the active middle coverage when outer rows dominate.
+            if outer_count >= 2 and coverage_count <= 1:
+                bonus -= 10.0 * recency_weight
+                payload["supports"].add(f"{analysis.label}:coverage-drift")
+
+            payload["core_score"] += bonus
 
 
 def _apply_overlap_bonus(
@@ -473,6 +575,22 @@ def _dataset_gap_days(frame: pd.DataFrame) -> int:
     latest_date = pd.Timestamp(frame.iloc[0]["draw_date"]).normalize()
     now = pd.Timestamp.now().normalize()
     return max(int((now - latest_date).days), 0)
+
+
+def _middle_pattern_digits(analysis: WinnerAnalysis) -> set[int]:
+    rows = list(analysis.cluster_rows)
+    if not rows:
+        return set()
+
+    middle_rows = set(rows)
+    for row in rows:
+        middle_rows.add(_prev_row(row))
+        middle_rows.add(_next_row(row))
+
+    digits: set[int] = set()
+    for row in middle_rows:
+        digits.update(GRID_ROWS[row])
+    return digits
 
 
 def _confidence_from_score(score: float) -> str:

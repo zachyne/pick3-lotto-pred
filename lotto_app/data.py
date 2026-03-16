@@ -198,10 +198,97 @@ def append_custom_record(
     return record
 
 
+def list_custom_records() -> pd.DataFrame:
+    if not CUSTOM_RESULTS_PATH.exists():
+        return pd.DataFrame(columns=["entry_id", "draw_type", "draw_date", "draw_number", "number", "source"])
+
+    frame = pd.read_csv(CUSTOM_RESULTS_PATH)
+    if frame.empty:
+        return pd.DataFrame(columns=["entry_id", "draw_type", "draw_date", "draw_number", "number", "source"])
+
+    frame = frame.fillna({"draw_number": "", "source": "manual"})
+    frame.insert(0, "entry_id", frame.index.astype(int))
+    return frame
+
+
+def update_custom_record(
+    entry_id: int,
+    draw_type: str,
+    draw_date: date,
+    winning_number: str,
+    draw_number: int | None = None,
+) -> DrawRecord:
+    records = list(_load_custom_records_if_present())
+    if entry_id < 0 or entry_id >= len(records):
+        raise ValueError("Manual entry not found.")
+
+    normalized_type = draw_type.strip().lower()
+    if normalized_type not in DRAW_TYPES:
+        raise ValueError("Draw type must be either midday or evening.")
+
+    updated_record = DrawRecord(
+        draw_type=normalized_type,
+        draw_date=draw_date,
+        draw_number=draw_number,
+        digits=parse_number(winning_number),
+        source="manual",
+    )
+
+    existing_records = [
+        DrawRecord(
+            draw_type=str(row["draw_type"]).strip().lower(),
+            draw_date=pd.Timestamp(row["draw_date"]).date(),
+            draw_number=int(row["draw_number"]) if pd.notna(row["draw_number"]) else None,
+            digits=parse_number(str(row["number"])),
+            source=str(row["source"]),
+        )
+        for _, row in load_all_records().iterrows()
+    ]
+    duplicate_exists = any(
+        _record_equals(updated_record, existing)
+        for existing in existing_records
+        if existing != records[entry_id]
+    )
+    if duplicate_exists:
+        raise ValueError("This exact result already exists in the dataset.")
+
+    records[entry_id] = updated_record
+    _write_custom_records(records)
+    return updated_record
+
+
+def delete_custom_record(entry_id: int) -> None:
+    records = list(_load_custom_records_if_present())
+    if entry_id < 0 or entry_id >= len(records):
+        raise ValueError("Manual entry not found.")
+
+    del records[entry_id]
+    _write_custom_records(records)
+
+
 def _load_custom_records_if_present() -> Iterable[DrawRecord]:
     if not CUSTOM_RESULTS_PATH.exists():
         return []
     return _load_custom_records(CUSTOM_RESULTS_PATH)
+
+
+def _write_custom_records(records: Iterable[DrawRecord]) -> None:
+    DATA_DIR.mkdir(exist_ok=True)
+    fieldnames = ["draw_type", "draw_date", "draw_number", "number", "source"]
+
+    with CUSTOM_RESULTS_PATH.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fieldnames)
+        writer.writeheader()
+        for record in records:
+            writer.writerow(
+                {
+                    "draw_type": record.draw_type,
+                    "draw_date": record.draw_date.isoformat(),
+                    "draw_number": record.draw_number or "",
+                    "number": record.number,
+                    "source": record.source,
+                }
+            )
 
 
 def _record_equals(left: DrawRecord, right: DrawRecord) -> bool:
