@@ -194,19 +194,35 @@ def render_add_result(records: pd.DataFrame) -> None:
         except Exception as exc:
             st.error(str(exc))
 
-    recent_manual = records[records["source"] == "manual"].copy()
-    if not recent_manual.empty:
+    manual_entries = list_custom_records()
+    if not manual_entries.empty:
+        recent_manual = manual_entries.copy()
+        recent_manual["draw_date"] = pd.to_datetime(recent_manual["draw_date"])
+        recent_manual = recent_manual.sort_values(
+            by=["draw_date", "entry_id"],
+            ascending=[False, False],
+        ).reset_index(drop=True)
         recent_manual["draw_date"] = recent_manual["draw_date"].dt.date
         st.write("Recently added manual entries")
-        st.dataframe(recent_manual.head(20), use_container_width=True, hide_index=True)
+        st.dataframe(
+            recent_manual[["draw_type", "draw_date", "draw_number", "number", "source"]].head(20),
+            use_container_width=True,
+            hide_index=True,
+        )
 
-    render_manage_manual_entries()
+    render_manage_manual_entries(manual_entries)
 
 
-def render_manage_manual_entries() -> None:
-    manual_entries = list_custom_records()
+def render_manage_manual_entries(manual_entries: pd.DataFrame) -> None:
     if manual_entries.empty:
         return
+
+    manual_entries = manual_entries.copy()
+    manual_entries["draw_date"] = pd.to_datetime(manual_entries["draw_date"])
+    manual_entries = manual_entries.sort_values(
+        by=["draw_date", "entry_id"],
+        ascending=[False, False],
+    ).reset_index(drop=True)
 
     st.divider()
     st.subheader("Edit or Delete Manual Entry")
