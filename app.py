@@ -8,6 +8,7 @@ import streamlit as st
 from lotto_app.data import (
     CUSTOM_RESULTS_PATH,
     NORMALIZED_EXPORT_PATH,
+    TEMPLATES_DIR,
     append_custom_record,
     delete_custom_record,
     list_custom_records,
@@ -21,12 +22,25 @@ st.set_page_config(page_title="ANY 3 Predictor", page_icon="🔢", layout="wide"
 
 
 @st.cache_data(show_spinner=False)
-def get_records() -> pd.DataFrame:
+def get_records(cache_key: tuple[tuple[str, int, int], ...]) -> pd.DataFrame:
+    del cache_key
     return load_all_records()
 
 
 def clear_records_cache() -> None:
     get_records.clear()
+
+
+def get_records_cache_key() -> tuple[tuple[str, int, int], ...]:
+    paths = sorted(TEMPLATES_DIR.glob("*.xlsx")) + [CUSTOM_RESULTS_PATH]
+    cache_key = []
+    for path in paths:
+        if path.exists():
+            stat = path.stat()
+            cache_key.append((str(path), stat.st_mtime_ns, stat.st_size))
+        else:
+            cache_key.append((str(path), 0, 0))
+    return tuple(cache_key)
 
 
 def main() -> None:
@@ -37,7 +51,7 @@ def main() -> None:
         "history only as a tiebreaker."
     )
 
-    records = get_records()
+    records = get_records(get_records_cache_key())
     if records.empty:
         st.error("No draw records were loaded.")
         return
