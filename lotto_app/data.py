@@ -1,23 +1,18 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
-from datetime import date, datetime
+from datetime import date
 from pathlib import Path
 import csv
 import re
-from typing import Iterable
+import sqlite3
 
 import pandas as pd
-from openpyxl import load_workbook
-
-
 ROOT = Path(__file__).resolve().parents[1]
-TEMPLATES_DIR = ROOT / "templates"
 DATA_DIR = ROOT / "data"
-CUSTOM_RESULTS_PATH = DATA_DIR / "custom_results.csv"
+DB_PATH = DATA_DIR / "lotto.db"
 NORMALIZED_EXPORT_PATH = DATA_DIR / "normalized_results.csv"
 
-DATE_FORMAT = "%A, %d %b %Y"
 DRAW_TYPES = {"midday", "evening"}
 
 
@@ -40,6 +35,78 @@ class DrawRecord:
         return payload
 
 
+# ---------------------------------------------------------------------------
+# Database helpers
+# ---------------------------------------------------------------------------
+
+def _connect() -> sqlite3.Connection:
+    DATA_DIR.mkdir(exist_ok=True)
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def _init_db() -> None:
+    with _connect() as conn:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS draw_records (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                draw_type   TEXT    NOT NULL,
+                draw_date   TEXT    NOT NULL,
+                draw_number INTEGER,
+                digit1      INTEGER NOT NULL,
+                digit2      INTEGER NOT NULL,
+                digit3      INTEGER NOT NULL,
+                source      TEXT    NOT NULL,
+                UNIQUE(draw_type, draw_date)
+            )
+        """)
+        conn.execute("DROP TABLE IF EXISTS custom_records")
+        conn.commit()
+    _sync_normalized_csv_to_db()
+
+
+def _sync_normalized_csv_to_db() -> None:
+    """Seed the canonical draw_records table from the normalized CSV export when empty."""
+    if not NORMALIZED_EXPORT_PATH.exists():
+        return
+
+    with _connect() as conn:
+        existing_count = conn.execute("SELECT COUNT(*) FROM draw_records").fetchone()[0]
+    if existing_count > 0:
+        return
+
+    records = _load_normalized_csv_records(NORMALIZED_EXPORT_PATH)
+    if not records:
+        return
+
+    with _connect() as conn:
+        for record in records:
+            conn.execute(
+                """
+                INSERT INTO draw_records
+                    (draw_type, draw_date, draw_number, digit1, digit2, digit3, source)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(draw_type, draw_date) DO UPDATE SET
+                    draw_number = excluded.draw_number,
+                    digit1 = excluded.digit1,
+                    digit2 = excluded.digit2,
+                    digit3 = excluded.digit3,
+                    source = excluded.source
+                """,
+                (
+                    record.draw_type,
+                    record.draw_date.isoformat(),
+                    record.draw_number,
+                    record.digits[0],
+                    record.digits[1],
+                    record.digits[2],
+                    record.source,
+                ),
+            )
+        conn.commit()
+
+
 def parse_number(raw_value: str) -> tuple[int, int, int]:
     digits = [int(char) for char in re.findall(r"\d", raw_value or "")]
     if len(digits) != 3:
@@ -47,74 +114,39 @@ def parse_number(raw_value: str) -> tuple[int, int, int]:
     return digits[0], digits[1], digits[2]
 
 
-def parse_draw_date(raw_value: str) -> date:
-    return datetime.strptime(raw_value.strip(), DATE_FORMAT).date()
-
-
-def _load_workbook_records(path: Path) -> list[DrawRecord]:
-    workbook = load_workbook(path, data_only=True)
-    worksheet = workbook[workbook.sheetnames[0]]
-    rows = [row[0] for row in worksheet.iter_rows(values_only=True)]
-
+def _load_normalized_csv_records(path: Path) -> list[DrawRecord]:
     records: list[DrawRecord] = []
-    index = 0
-    while index < len(rows):
-        label = rows[index]
-        if isinstance(label, str) and label.strip().lower() in DRAW_TYPES:
-            draw_type = label.strip().lower()
-            try:
-                draw_date = parse_draw_date(str(rows[index + 2]))
-                draw_number = _extract_draw_number(rows[index + 3])
-                digits = tuple(int(rows[index + offset]) for offset in (5, 6, 7))
-            except (IndexError, TypeError, ValueError):
-                index += 1
+    with path.open(newline="", encoding="utf-8") as handle:
+        reader = csv.DictReader(handle)
+        for row in reader:
+            number = str(row.get("number") or "").strip()
+            if not number:
                 continue
-
             records.append(
                 DrawRecord(
-                    draw_type=draw_type,
-                    draw_date=draw_date,
-                    draw_number=draw_number,
-                    digits=digits,
-                    source=path.name,
+                    draw_type=str(row["draw_type"]).strip().lower(),
+                    draw_date=date.fromisoformat(str(row["draw_date"]).strip()),
+                    draw_number=int(float(row["draw_number"])) if row.get("draw_number") else None,
+                    digits=parse_number(number),
+                    source=str(row.get("source") or "unknown").strip(),
                 )
             )
-            index += 8
-            continue
-
-        index += 1
-
     return records
 
 
-def _extract_draw_number(raw_value: object) -> int | None:
-    if raw_value is None:
-        return None
-    match = re.search(r"(\d+)", str(raw_value))
-    return int(match.group(1)) if match else None
-
+# ---------------------------------------------------------------------------
+# Public API
+# ---------------------------------------------------------------------------
 
 def load_all_records() -> pd.DataFrame:
     DATA_DIR.mkdir(exist_ok=True)
 
-    records: list[DrawRecord] = []
-    for path in sorted(TEMPLATES_DIR.glob("*.xlsx")):
-        records.extend(_load_workbook_records(path))
+    records = _load_draw_records()
+    if not records:
+        _sync_normalized_csv_to_db()
+        records = _load_draw_records()
 
-    if CUSTOM_RESULTS_PATH.exists():
-        records.extend(_load_custom_records(CUSTOM_RESULTS_PATH))
-
-    deduped = {}
-    for record in records:
-        key = (
-            record.draw_type,
-            record.draw_date.isoformat(),
-            record.draw_number,
-            record.digits,
-        )
-        deduped[key] = record
-
-    frame = pd.DataFrame(record.to_dict() for record in deduped.values())
+    frame = pd.DataFrame(record.to_dict() for record in records)
     if frame.empty:
         return frame
 
@@ -129,24 +161,28 @@ def load_all_records() -> pd.DataFrame:
     return frame
 
 
-def _load_custom_records(path: Path) -> list[DrawRecord]:
-    records: list[DrawRecord] = []
-    with path.open(newline="", encoding="utf-8") as handle:
-        reader = csv.DictReader(handle)
-        for row in reader:
-            records.append(
-                DrawRecord(
-                    draw_type=str(row["draw_type"]).strip().lower(),
-                    draw_date=datetime.strptime(row["draw_date"], "%Y-%m-%d").date(),
-                    draw_number=int(row["draw_number"]) if row["draw_number"] else None,
-                    digits=parse_number(str(row["number"])),
-                    source=str(row.get("source") or "manual"),
-                )
-            )
-    return records
+def _load_draw_records() -> list[DrawRecord]:
+    with _connect() as conn:
+        rows = conn.execute(
+            """
+            SELECT draw_type, draw_date, draw_number, digit1, digit2, digit3, source
+            FROM draw_records
+            ORDER BY draw_type, draw_date DESC, draw_number DESC
+            """
+        ).fetchall()
+    return [
+        DrawRecord(
+            draw_type=row["draw_type"],
+            draw_date=date.fromisoformat(row["draw_date"]),
+            draw_number=row["draw_number"],
+            digits=(row["digit1"], row["digit2"], row["digit3"]),
+            source=row["source"],
+        )
+        for row in rows
+    ]
 
 
-def append_custom_record(
+def append_record(
     draw_type: str,
     draw_date: date,
     winning_number: str,
@@ -164,7 +200,6 @@ def append_custom_record(
         source="manual",
     )
 
-    DATA_DIR.mkdir(exist_ok=True)
     existing_records = [
         DrawRecord(
             draw_type=str(row["draw_type"]).strip().lower(),
@@ -175,56 +210,85 @@ def append_custom_record(
         )
         for _, row in load_all_records().iterrows()
     ]
-    already_exists = any(_record_equals(record, existing) for existing in existing_records)
-    if already_exists:
+    if any(
+        existing.draw_type == record.draw_type and existing.draw_date == record.draw_date
+        for existing in existing_records
+    ):
+        raise ValueError("A record for that draw type and date already exists.")
+    if any(_record_equals(record, existing) for existing in existing_records):
         raise ValueError("This exact result already exists in the dataset.")
 
-    write_header = not CUSTOM_RESULTS_PATH.exists()
-    with CUSTOM_RESULTS_PATH.open("a", newline="", encoding="utf-8") as handle:
-        fieldnames = ["draw_type", "draw_date", "draw_number", "number", "source"]
-        writer = csv.DictWriter(handle, fieldnames=fieldnames)
-        if write_header:
-            writer.writeheader()
-        writer.writerow(
-            {
-                "draw_type": record.draw_type,
-                "draw_date": record.draw_date.isoformat(),
-                "draw_number": record.draw_number or "",
-                "number": record.number,
-                "source": record.source,
-            }
+    with _connect() as conn:
+        conn.execute(
+            """
+            INSERT INTO draw_records
+                (draw_type, draw_date, draw_number, digit1, digit2, digit3, source)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(draw_type, draw_date) DO UPDATE SET
+                draw_number = excluded.draw_number,
+                digit1 = excluded.digit1,
+                digit2 = excluded.digit2,
+                digit3 = excluded.digit3,
+                source = excluded.source
+            """,
+            (
+                record.draw_type,
+                record.draw_date.isoformat(),
+                record.draw_number,
+                record.digits[0],
+                record.digits[1],
+                record.digits[2],
+                record.source,
+            ),
         )
+        conn.commit()
 
     return record
 
 
-def list_custom_records() -> pd.DataFrame:
-    if not CUSTOM_RESULTS_PATH.exists():
-        return pd.DataFrame(columns=["entry_id", "draw_type", "draw_date", "draw_number", "number", "source"])
+def list_records() -> pd.DataFrame:
+    with _connect() as conn:
+        rows = conn.execute(
+            "SELECT id, draw_type, draw_date, draw_number, digit1, digit2, digit3, source "
+            "FROM draw_records ORDER BY draw_date DESC, id DESC"
+        ).fetchall()
 
-    frame = pd.read_csv(CUSTOM_RESULTS_PATH)
-    if frame.empty:
-        return pd.DataFrame(columns=["entry_id", "draw_type", "draw_date", "draw_number", "number", "source"])
+    if not rows:
+        return pd.DataFrame(
+            columns=["entry_id", "draw_type", "draw_date", "draw_number", "number", "source"]
+        )
 
-    frame = frame.fillna({"draw_number": "", "source": "manual"})
-    frame.insert(0, "entry_id", frame.index.astype(int))
-    return frame
+    data = [
+        {
+            "entry_id": row["id"],
+            "draw_type": row["draw_type"],
+            "draw_date": row["draw_date"],
+            "draw_number": row["draw_number"] if row["draw_number"] is not None else "",
+            "number": f"{row['digit1']}-{row['digit2']}-{row['digit3']}",
+            "source": row["source"],
+        }
+        for row in rows
+    ]
+    return pd.DataFrame(data)
 
 
-def update_custom_record(
+def update_record(
     entry_id: int,
     draw_type: str,
     draw_date: date,
     winning_number: str,
     draw_number: int | None = None,
 ) -> DrawRecord:
-    records = list(_load_custom_records_if_present())
-    if entry_id < 0 or entry_id >= len(records):
-        raise ValueError("Manual entry not found.")
-
     normalized_type = draw_type.strip().lower()
     if normalized_type not in DRAW_TYPES:
         raise ValueError("Draw type must be either midday or evening.")
+
+    with _connect() as conn:
+        existing = conn.execute(
+            "SELECT id FROM draw_records WHERE id = ?", (entry_id,)
+        ).fetchone()
+        if existing is None:
+            raise ValueError("Record not found.")
 
     updated_record = DrawRecord(
         draw_type=normalized_type,
@@ -244,51 +308,70 @@ def update_custom_record(
         )
         for _, row in load_all_records().iterrows()
     ]
+    # Exclude the record being updated from the duplicate check
+    with _connect() as conn:
+        old_row = conn.execute(
+            "SELECT draw_type, draw_date, draw_number, digit1, digit2, digit3, source "
+            "FROM draw_records WHERE id = ?",
+            (entry_id,),
+        ).fetchone()
+    old_record = DrawRecord(
+        draw_type=old_row["draw_type"],
+        draw_date=date.fromisoformat(old_row["draw_date"]),
+        draw_number=old_row["draw_number"],
+        digits=(old_row["digit1"], old_row["digit2"], old_row["digit3"]),
+        source=old_row["source"],
+    )
     duplicate_exists = any(
         _record_equals(updated_record, existing)
         for existing in existing_records
-        if existing != records[entry_id]
+        if not _record_equals(existing, old_record)
     )
     if duplicate_exists:
         raise ValueError("This exact result already exists in the dataset.")
+    date_slot_taken = any(
+        existing.draw_type == updated_record.draw_type and existing.draw_date == updated_record.draw_date
+        for existing in existing_records
+        if not _record_equals(existing, old_record)
+    )
+    if date_slot_taken:
+        raise ValueError("Another record already exists for that draw type and date.")
 
-    records[entry_id] = updated_record
-    _write_custom_records(records)
+    with _connect() as conn:
+        conn.execute(
+            "UPDATE draw_records "
+            "SET draw_type=?, draw_date=?, draw_number=?, digit1=?, digit2=?, digit3=?, source=? "
+            "WHERE id=?",
+            (
+                updated_record.draw_type,
+                updated_record.draw_date.isoformat(),
+                updated_record.draw_number,
+                updated_record.digits[0],
+                updated_record.digits[1],
+                updated_record.digits[2],
+                updated_record.source,
+                entry_id,
+            ),
+        )
+        conn.commit()
+
     return updated_record
 
 
-def delete_custom_record(entry_id: int) -> None:
-    records = list(_load_custom_records_if_present())
-    if entry_id < 0 or entry_id >= len(records):
-        raise ValueError("Manual entry not found.")
-
-    del records[entry_id]
-    _write_custom_records(records)
-
-
-def _load_custom_records_if_present() -> Iterable[DrawRecord]:
-    if not CUSTOM_RESULTS_PATH.exists():
-        return []
-    return _load_custom_records(CUSTOM_RESULTS_PATH)
-
-
-def _write_custom_records(records: Iterable[DrawRecord]) -> None:
-    DATA_DIR.mkdir(exist_ok=True)
-    fieldnames = ["draw_type", "draw_date", "draw_number", "number", "source"]
-
-    with CUSTOM_RESULTS_PATH.open("w", newline="", encoding="utf-8") as handle:
-        writer = csv.DictWriter(handle, fieldnames=fieldnames)
-        writer.writeheader()
-        for record in records:
-            writer.writerow(
-                {
-                    "draw_type": record.draw_type,
-                    "draw_date": record.draw_date.isoformat(),
-                    "draw_number": record.draw_number or "",
-                    "number": record.number,
-                    "source": record.source,
-                }
-            )
+def delete_record(entry_id: int) -> None:
+    with _connect() as conn:
+        existing = conn.execute(
+            """
+            SELECT id
+            FROM draw_records
+            WHERE id = ?
+            """,
+            (entry_id,),
+        ).fetchone()
+        if existing is None:
+            raise ValueError("Record not found.")
+        conn.execute("DELETE FROM draw_records WHERE id = ?", (entry_id,))
+        conn.commit()
 
 
 def _record_equals(left: DrawRecord, right: DrawRecord) -> bool:
@@ -298,3 +381,7 @@ def _record_equals(left: DrawRecord, right: DrawRecord) -> bool:
         and left.draw_number == right.draw_number
         and left.digits == right.digits
     )
+
+
+# Initialize DB on import.
+_init_db()

@@ -236,6 +236,42 @@ def build_candidates(analysis: WinnerAnalysis, recency_weight: float) -> dict[tu
     return candidate_map
 
 
+def generate_coverage_combos(
+    analysis: WinnerAnalysis,
+    include_doubles: bool = True,
+) -> tuple[tuple[int, int, int], ...]:
+    combos = {
+        canonical_combo(combo)
+        for combo in (
+            analysis.cluster_row_combos
+            + analysis.zone_row_combos_plus_1
+            + analysis.zone_row_combos_plus_2
+        )
+    }
+
+    cluster_subsets = {
+        pair
+        for combo in analysis.cluster_row_combos
+        for pair in combinations(combo, 2)
+    }
+    for left, right in cluster_subsets:
+        for digit in analysis.zone_digits_plus_1:
+            combos.add(canonical_combo((left, right, digit)))
+
+    repeated_digits = {
+        digit
+        for digit in analysis.last_winner
+        if analysis.last_winner.count(digit) > 1
+    }
+    if include_doubles and repeated_digits:
+        for repeated in sorted(repeated_digits):
+            for digit in analysis.combined_zone_digits:
+                combos.add(canonical_combo((repeated, repeated, digit)))
+                combos.add(canonical_combo((pair_of(repeated), pair_of(repeated), digit)))
+
+    return tuple(sorted(combos))
+
+
 def predict_next(
     records: pd.DataFrame,
     draw_type: str,
@@ -280,12 +316,15 @@ def predict_next(
     )
 
     dataset_freshness_days = _dataset_gap_days(frame)
+    primary_analysis = analyses[0]
     return {
         "draw_type": draw_type.upper(),
         "latest_inputs": frame.head(winners_to_use).copy(),
         "analyses": analyses,
         "top_candidates": candidates[:top_n],
         "all_candidates": candidates,
+        "coverage_candidates": generate_coverage_combos(primary_analysis),
+        "coverage_digits": primary_analysis.combined_zone_digits,
         "core_score_snapshot": core_only_snapshot,
         "hit_rates": hit_rates,
         "dataset_freshness_days": dataset_freshness_days,

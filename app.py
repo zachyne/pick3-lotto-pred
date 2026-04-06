@@ -6,14 +6,13 @@ import pandas as pd
 import streamlit as st
 
 from lotto_app.data import (
-    CUSTOM_RESULTS_PATH,
+    DB_PATH,
     NORMALIZED_EXPORT_PATH,
-    TEMPLATES_DIR,
-    append_custom_record,
-    delete_custom_record,
-    list_custom_records,
+    append_record,
+    delete_record,
+    list_records,
     load_all_records,
-    update_custom_record,
+    update_record,
 )
 from lotto_app.model import grid_table, predict_next
 
@@ -32,7 +31,7 @@ def clear_records_cache() -> None:
 
 
 def get_records_cache_key() -> tuple[tuple[str, int, int], ...]:
-    paths = sorted(TEMPLATES_DIR.glob("*.xlsx")) + [CUSTOM_RESULTS_PATH]
+    paths = [DB_PATH]
     cache_key = []
     for path in paths:
         if path.exists():
@@ -62,8 +61,6 @@ def main() -> None:
         winners_to_use = st.slider("Recent winners to use", min_value=2, max_value=5, value=3)
         top_n = st.slider("How many candidates to show", min_value=5, max_value=30, value=18)
         history_depth = st.slider("Recent history tiebreaker depth", min_value=10, max_value=30, value=20)
-        st.write(f"Normalized dataset: `{NORMALIZED_EXPORT_PATH}`")
-        st.write(f"Manual entries file: `{CUSTOM_RESULTS_PATH}`")
 
     prediction_tab, add_tab, history_tab = st.tabs(["Predict", "Add Result", "History"])
 
@@ -125,6 +122,28 @@ def render_prediction(
     st.write("Top candidate bets")
     st.dataframe(candidates, use_container_width=True, hide_index=True)
 
+    coverage_set = set(result["coverage_candidates"])
+    coverage_ranked = [
+        candidate for candidate in result["all_candidates"]
+        if candidate.combo in coverage_set
+    ]
+    coverage_candidates = pd.DataFrame(
+        {
+            "rank": list(range(1, len(coverage_ranked) + 1)),
+            "combo": [candidate.combo_label for candidate in coverage_ranked],
+            "total_score": [candidate.total_score for candidate in coverage_ranked],
+            "best_tier": [candidate.best_tier for candidate in coverage_ranked],
+            "confidence": [candidate.confidence for candidate in coverage_ranked],
+        }
+    )
+    coverage_digits = ", ".join(str(digit) for digit in result["coverage_digits"])
+    with st.expander(
+        f"All possible combinations within coverage ({len(result['coverage_candidates'])})",
+        expanded=False,
+    ):
+        st.caption(f"Generated from the latest coverage digits: {coverage_digits}")
+        st.dataframe(coverage_candidates, use_container_width=True, hide_index=True)
+
     hit_rates = result["hit_rates"]
     if hit_rates and hit_rates["sample_size"] > 0:
         st.write("Recent backtest snapshot")
@@ -184,7 +203,7 @@ def render_prediction(
 
 def render_add_result(records: pd.DataFrame) -> None:
     st.subheader("Add a Winning Number")
-    st.caption("This writes to `data/custom_results.csv` and is immediately included in the next prediction run.")
+    st.caption("This writes to `data/lotto.db` and is immediately included in the next prediction run.")
 
     with st.form("add-result-form", clear_on_submit=True):
         draw_type = st.selectbox("Draw type", ["midday", "evening"], key="add_draw_type")
@@ -196,7 +215,7 @@ def render_add_result(records: pd.DataFrame) -> None:
     if submitted:
         try:
             draw_number = int(draw_number_text) if draw_number_text.strip() else None
-            append_custom_record(
+            append_record(
                 draw_type=draw_type,
                 draw_date=draw_date,
                 winning_number=winning_number,
@@ -208,102 +227,183 @@ def render_add_result(records: pd.DataFrame) -> None:
         except Exception as exc:
             st.error(str(exc))
 
-    manual_entries = list_custom_records()
-    if not manual_entries.empty:
-        recent_manual = manual_entries.copy()
-        recent_manual["draw_date"] = pd.to_datetime(recent_manual["draw_date"])
-        recent_manual = recent_manual.sort_values(
+    record_entries = list_records()
+    if not record_entries.empty:
+        recent_records = record_entries.copy()
+        recent_records["draw_date"] = pd.to_datetime(recent_records["draw_date"])
+        recent_records = recent_records.sort_values(
             by=["draw_date", "entry_id"],
             ascending=[False, False],
         ).reset_index(drop=True)
-        recent_manual["draw_date"] = recent_manual["draw_date"].dt.date
-        st.write("Recently added manual entries")
+        recent_records["draw_date"] = recent_records["draw_date"].dt.date
+        st.write("Recent records in the database")
         st.dataframe(
-            recent_manual[["draw_type", "draw_date", "draw_number", "number", "source"]].head(20),
+            recent_records[["draw_type", "draw_date", "draw_number", "number", "source"]].head(20),
             use_container_width=True,
             hide_index=True,
         )
 
-    render_manage_manual_entries(manual_entries)
+    render_manage_records(record_entries)
 
 
-def render_manage_manual_entries(manual_entries: pd.DataFrame) -> None:
-    if manual_entries.empty:
+def render_manage_records(records_df: pd.DataFrame) -> None:
+    if records_df.empty:
         return
 
-    manual_entries = manual_entries.copy()
-    manual_entries["draw_date"] = pd.to_datetime(manual_entries["draw_date"])
-    manual_entries = manual_entries.sort_values(
+    records_df = records_df.copy()
+    records_df["draw_date"] = pd.to_datetime(records_df["draw_date"])
+    records_df = records_df.sort_values(
         by=["draw_date", "entry_id"],
         ascending=[False, False],
     ).reset_index(drop=True)
 
     st.divider()
-    st.subheader("Edit or Delete Manual Entry")
+    st.subheader("Edit or Delete Record")
+    filter_col1, filter_col2 = st.columns([1, 2])
+    with filter_col1:
+        draw_type_filter = st.selectbox("Filter draw type", ["all", "midday", "evening"])
+    with filter_col2:
+        search_text = st.text_input(
+            "Find record",
+            placeholder="Search by date, number, draw number, or source",
+        ).strip().lower()
 
-    date_options = []
-    date_to_entry_id = {}
-    for row in manual_entries.itertuples(index=False):
-        draw_date = pd.Timestamp(row.draw_date).date()
-        label = str(draw_date)
-        if label in date_to_entry_id:
-            label = f"{draw_date} ({row.draw_type}, #{row.entry_id})"
-        date_options.append(label)
-        date_to_entry_id[label] = int(row.entry_id)
+    filtered_records = records_df.copy()
+    if draw_type_filter != "all":
+        filtered_records = filtered_records[filtered_records["draw_type"] == draw_type_filter]
+    if search_text:
+        search_series = (
+            filtered_records["draw_date"].dt.strftime("%Y-%m-%d")
+            + " "
+            + filtered_records["draw_type"].astype(str)
+            + " "
+            + filtered_records["draw_number"].fillna("").astype(str)
+            + " "
+            + filtered_records["number"].astype(str)
+            + " "
+            + filtered_records["source"].astype(str)
+        ).str.lower()
+        filtered_records = filtered_records[search_series.str.contains(search_text, regex=False)]
 
-    selected_label = st.selectbox("Select entry date", date_options)
-    selected_entry_id = date_to_entry_id[selected_label]
-    selected_row = manual_entries.loc[manual_entries["entry_id"] == selected_entry_id].iloc[0]
-    selected_draw_number = str(int(selected_row["draw_number"])) if str(selected_row["draw_number"]).strip() else ""
+    if filtered_records.empty:
+        st.info("No records match the current filters.")
+        return
 
-    with st.form("edit-result-form"):
-        edit_draw_type = st.selectbox(
-            "Draw type",
-            ["midday", "evening"],
-            index=0 if selected_row["draw_type"] == "midday" else 1,
-            key="edit_draw_type",
-        )
-        edit_draw_date = st.date_input(
-            "Draw date",
-            value=pd.Timestamp(selected_row["draw_date"]).date(),
-            key="edit_draw_date",
-        )
-        edit_winning_number = st.text_input(
-            "Winning number",
-            value=str(selected_row["number"]),
-            key="edit_winning_number",
-        )
-        edit_draw_number = st.text_input(
-            "Draw number (optional)",
-            value=selected_draw_number,
-            key="edit_draw_number",
-        )
-        save_changes = st.form_submit_button("Save changes")
+    preview = filtered_records.head(25).copy()
+    preview["draw_date"] = preview["draw_date"].dt.date
 
-    if save_changes:
-        try:
-            parsed_draw_number = int(edit_draw_number) if edit_draw_number.strip() else None
-            update_custom_record(
-                entry_id=selected_entry_id,
-                draw_type=edit_draw_type,
-                draw_date=edit_draw_date,
-                winning_number=edit_winning_number,
-                draw_number=parsed_draw_number,
+    header_cols = st.columns([1.1, 1.1, 1.0, 1.0, 1.0, 0.8])
+    header_cols[0].markdown("**Date**")
+    header_cols[1].markdown("**Draw Type**")
+    header_cols[2].markdown("**Draw #**")
+    header_cols[3].markdown("**Number**")
+    header_cols[4].markdown("**Source**")
+    header_cols[5].markdown("**Actions**")
+
+    selected_entry_id = st.session_state.get("selected_record_id")
+    for row in preview.itertuples(index=False):
+        cols = st.columns([1.1, 1.1, 1.0, 1.0, 1.0, 0.8], vertical_alignment="center")
+        cols[0].write(pd.Timestamp(row.draw_date).date().isoformat())
+        cols[1].write(str(row.draw_type).title())
+        cols[2].write(str(int(row.draw_number)) if str(row.draw_number).strip() else "-")
+        cols[3].write(str(row.number))
+        cols[4].write(str(row.source))
+
+        action_cols = cols[5].columns(2)
+        if action_cols[0].button(
+            "✎",
+            key=f"edit_record_{row.entry_id}",
+            use_container_width=True,
+        ):
+            st.session_state["selected_record_id"] = int(row.entry_id)
+            st.session_state["edit_record_id"] = int(row.entry_id)
+            st.session_state.pop("delete_record_id", None)
+            selected_entry_id = int(row.entry_id)
+        if action_cols[1].button(
+            "🗑",
+            key=f"delete_record_{row.entry_id}",
+            use_container_width=True,
+            type="secondary",
+        ):
+            st.session_state["selected_record_id"] = int(row.entry_id)
+            st.session_state["delete_record_id"] = int(row.entry_id)
+            st.session_state.pop("edit_record_id", None)
+            selected_entry_id = int(row.entry_id)
+
+    if selected_entry_id is None:
+        selected_entry_id = int(preview.iloc[0]["entry_id"])
+        st.session_state["selected_record_id"] = selected_entry_id
+
+    selected_row = filtered_records.loc[filtered_records["entry_id"] == selected_entry_id]
+    if selected_row.empty:
+        selected_entry_id = int(preview.iloc[0]["entry_id"])
+        st.session_state["selected_record_id"] = selected_entry_id
+        selected_row = filtered_records.loc[filtered_records["entry_id"] == selected_entry_id]
+    selected_row = selected_row.iloc[0]
+    edit_record_id = st.session_state.get("edit_record_id")
+    if edit_record_id == selected_entry_id:
+        st.caption(
+            "Editing: "
+            f"{pd.Timestamp(selected_row['draw_date']).date().isoformat()} | "
+            f"{selected_row['draw_type']} | draw #{int(selected_row['draw_number']) if str(selected_row['draw_number']).strip() else '-'}"
+        )
+        with st.form("edit-result-form"):
+            edit_winning_number = st.text_input(
+                "Winning number",
+                value=str(selected_row["number"]),
+                key=f"edit_winning_number_{selected_entry_id}",
             )
-            clear_records_cache()
-            st.success("Manual entry updated.")
-            st.rerun()
-        except Exception as exc:
-            st.error(str(exc))
+            save_col, cancel_col = st.columns([1, 1])
+            save_changes = save_col.form_submit_button("Save number")
+            cancel_edit = cancel_col.form_submit_button("Cancel")
 
-    if st.button("Delete selected entry", type="secondary"):
-        try:
-            delete_custom_record(selected_entry_id)
-            clear_records_cache()
-            st.success("Manual entry deleted.")
+        if cancel_edit:
+            st.session_state.pop("edit_record_id", None)
             st.rerun()
-        except Exception as exc:
-            st.error(str(exc))
+
+        if save_changes:
+            try:
+                parsed_draw_number = (
+                    int(selected_row["draw_number"])
+                    if str(selected_row["draw_number"]).strip()
+                    else None
+                )
+                update_record(
+                    entry_id=selected_entry_id,
+                    draw_type=str(selected_row["draw_type"]),
+                    draw_date=pd.Timestamp(selected_row["draw_date"]).date(),
+                    winning_number=edit_winning_number,
+                    draw_number=parsed_draw_number,
+                )
+                st.session_state.pop("edit_record_id", None)
+                clear_records_cache()
+                st.success("Record updated.")
+                st.rerun()
+            except Exception as exc:
+                st.error(str(exc))
+
+    pending_delete_id = st.session_state.get("delete_record_id")
+    if pending_delete_id == selected_entry_id:
+        st.warning(
+            "Delete this record permanently? "
+            f"{pd.Timestamp(selected_row['draw_date']).date().isoformat()} | "
+            f"{selected_row['draw_type']} | {selected_row['number']}"
+        )
+        confirm_col, cancel_col = st.columns([1, 1])
+        if confirm_col.button("Yes, delete", type="secondary", use_container_width=True):
+            try:
+                delete_record(selected_entry_id)
+                st.session_state.pop("delete_record_id", None)
+                st.session_state.pop("selected_record_id", None)
+                clear_records_cache()
+                st.success("Record deleted.")
+                st.rerun()
+            except Exception as exc:
+                st.error(str(exc))
+
+        if cancel_col.button("Cancel", key="cancel_delete_record", use_container_width=True):
+            st.session_state.pop("delete_record_id", None)
+            st.rerun()
 
 
 def render_history(records: pd.DataFrame, draw_type: str) -> None:
@@ -311,7 +411,7 @@ def render_history(records: pd.DataFrame, draw_type: str) -> None:
     filtered = records[records["draw_type"] == draw_type].copy()
     filtered["draw_date"] = filtered["draw_date"].dt.date
     st.dataframe(filtered.head(50), use_container_width=True, hide_index=True)
-    st.caption("The app merges both Excel templates with your manual entries, then exports a normalized CSV to `data/normalized_results.csv`.")
+    st.caption("The app reads from `data/lotto.db` and exports the current snapshot to `data/normalized_results.csv`.")
 
 
 if __name__ == "__main__":
