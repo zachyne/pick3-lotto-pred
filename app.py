@@ -207,10 +207,25 @@ def render_add_result(records: pd.DataFrame) -> None:
 
     with st.form("add-result-form", clear_on_submit=True):
         draw_type = st.selectbox("Draw type", ["midday", "evening"], key="add_draw_type")
-        draw_date = st.date_input("Draw date", value=date.today())
+        draw_date = st.date_input("Draw date", value=date.today(), key="add_draw_date")
         winning_number = st.text_input("Winning number", placeholder="e.g. 0-6-1 or 061")
         draw_number_text = st.text_input("Draw number (optional)", placeholder="e.g. 2625")
         submitted = st.form_submit_button("Save result")
+
+    existing_slot = records[
+        (records["draw_type"] == draw_type)
+        & (records["draw_date"].dt.date == draw_date)
+    ].copy()
+    if not existing_slot.empty:
+        slot_row = existing_slot.sort_values(by=["draw_date"], ascending=False).iloc[0]
+        draw_number_label = (
+            str(int(slot_row["draw_number"])) if pd.notna(slot_row["draw_number"]) else "-"
+        )
+        st.warning(
+            f"A {draw_type} record already exists for {draw_date.isoformat()} "
+            f"(draw #{draw_number_label}, number {slot_row['number']}, source {slot_row['source']}). "
+            "Update or delete it before creating a new one."
+        )
 
     if submitted:
         try:

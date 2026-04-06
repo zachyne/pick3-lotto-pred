@@ -214,7 +214,10 @@ def append_record(
         existing.draw_type == record.draw_type and existing.draw_date == record.draw_date
         for existing in existing_records
     ):
-        raise ValueError("A record for that draw type and date already exists.")
+        raise ValueError(
+            f"A {record.draw_type} record already exists for {record.draw_date.isoformat()}. "
+            "Update or delete that record before creating a new one."
+        )
     if any(_record_equals(record, existing) for existing in existing_records):
         raise ValueError("This exact result already exists in the dataset.")
 
@@ -335,7 +338,10 @@ def update_record(
         if not _record_equals(existing, old_record)
     )
     if date_slot_taken:
-        raise ValueError("Another record already exists for that draw type and date.")
+        raise ValueError(
+            f"A {updated_record.draw_type} record already exists for {updated_record.draw_date.isoformat()}. "
+            "Delete that record first or keep this update in the same date slot."
+        )
 
     with _connect() as conn:
         conn.execute(
