@@ -6,12 +6,11 @@ import pandas as pd
 import streamlit as st
 
 from lotto_app.data import (
-    DB_PATH,
-    NORMALIZED_EXPORT_PATH,
     append_record,
     delete_record,
     list_records,
     load_all_records,
+    storage_backend_label,
     update_record,
 )
 from lotto_app.model import grid_table, predict_next
@@ -20,26 +19,45 @@ from lotto_app.model import grid_table, predict_next
 st.set_page_config(page_title="ANY 3 Predictor", page_icon="🔢", layout="wide")
 
 
-@st.cache_data(show_spinner=False)
-def get_records(cache_key: tuple[tuple[str, int, int], ...]) -> pd.DataFrame:
-    del cache_key
+def get_records() -> pd.DataFrame:
     return load_all_records()
 
 
-def clear_records_cache() -> None:
-    get_records.clear()
+def build_third_digit_summary(top_candidates: list) -> pd.DataFrame:
+    summary: dict[int, dict[str, object]] = {}
+    for candidate in top_candidates:
+        payload = summary.setdefault(
+            candidate.recommended_third_digit,
+            {
+                "third_digit": candidate.recommended_third_digit,
+                "cumulative_score": 0.0,
+                "best_score": 0.0,
+                "core_pairs": set(),
+                "signals": set(),
+                "candidate_count": 0,
+            },
+        )
+        payload["cumulative_score"] += candidate.third_digit_score
+        payload["best_score"] = max(payload["best_score"], candidate.third_digit_score)
+        payload["core_pairs"].add("-".join(str(digit) for digit in candidate.recommended_core))
+        payload["signals"].update(candidate.third_digit_signals[:2])
+        payload["candidate_count"] += 1
 
-
-def get_records_cache_key() -> tuple[tuple[str, int, int], ...]:
-    paths = [DB_PATH]
-    cache_key = []
-    for path in paths:
-        if path.exists():
-            stat = path.stat()
-            cache_key.append((str(path), stat.st_mtime_ns, stat.st_size))
-        else:
-            cache_key.append((str(path), 0, 0))
-    return tuple(cache_key)
+    rows = [
+        {
+            "third_digit": payload["third_digit"],
+            "candidate_count": payload["candidate_count"],
+            "cumulative_score": round(float(payload["cumulative_score"]), 2),
+            "best_score": round(float(payload["best_score"]), 2),
+            "core_pairs": ", ".join(sorted(payload["core_pairs"])),
+            "signals": "; ".join(sorted(payload["signals"])[:3]),
+        }
+        for payload in summary.values()
+    ]
+    return pd.DataFrame(rows).sort_values(
+        by=["cumulative_score", "best_score", "third_digit"],
+        ascending=[False, False, True],
+    ).reset_index(drop=True)
 
 
 def main() -> None:
@@ -50,7 +68,7 @@ def main() -> None:
         "history only as a tiebreaker."
     )
 
-    records = get_records(get_records_cache_key())
+    records = get_records()
     if records.empty:
         st.error("No draw records were loaded.")
         return
@@ -112,8 +130,21 @@ def render_prediction(
             "total_score": [candidate.total_score for candidate in result["top_candidates"]],
             "core_score": [candidate.core_score for candidate in result["top_candidates"]],
             "history_score": [candidate.history_score for candidate in result["top_candidates"]],
+            "third_digit_score": [candidate.third_digit_score for candidate in result["top_candidates"]],
             "best_tier": [candidate.best_tier for candidate in result["top_candidates"]],
             "confidence": [candidate.confidence for candidate in result["top_candidates"]],
+            "suggested_core": [
+                "-".join(str(digit) for digit in candidate.recommended_core)
+                for candidate in result["top_candidates"]
+            ],
+            "suggested_third_digit": [
+                candidate.recommended_third_digit
+                for candidate in result["top_candidates"]
+            ],
+            "third_digit_signals": [
+                "; ".join(candidate.third_digit_signals[:3])
+                for candidate in result["top_candidates"]
+            ],
             "source_signal": [", ".join(candidate.sources) for candidate in result["top_candidates"]],
             "why": ["; ".join(candidate.support[:3]) for candidate in result["top_candidates"]],
         }
@@ -121,6 +152,11 @@ def render_prediction(
 
     st.write("Top candidate bets")
     st.dataframe(candidates, use_container_width=True, hide_index=True)
+
+    third_digit_summary = build_third_digit_summary(result["top_candidates"])
+    if not third_digit_summary.empty:
+        st.write("Third digit signals")
+        st.dataframe(third_digit_summary.head(8), use_container_width=True, hide_index=True)
 
     coverage_set = set(result["coverage_candidates"])
     coverage_ranked = [
@@ -203,7 +239,7 @@ def render_prediction(
 
 def render_add_result(records: pd.DataFrame) -> None:
     st.subheader("Add a Winning Number")
-    st.caption("This writes to `data/lotto.db` and is immediately included in the next prediction run.")
+    st.caption(f"This writes to {storage_backend_label()} and is immediately included in the next prediction run.")
 
     with st.form("add-result-form", clear_on_submit=True):
         draw_type = st.selectbox("Draw type", ["midday", "evening"], key="add_draw_type")
@@ -236,7 +272,6 @@ def render_add_result(records: pd.DataFrame) -> None:
                 winning_number=winning_number,
                 draw_number=draw_number,
             )
-            clear_records_cache()
             st.success("Result saved. Refreshing predictions with the updated dataset.")
             st.rerun()
         except Exception as exc:
@@ -391,7 +426,6 @@ def render_manage_records(records_df: pd.DataFrame) -> None:
                     draw_number=parsed_draw_number,
                 )
                 st.session_state.pop("edit_record_id", None)
-                clear_records_cache()
                 st.success("Record updated.")
                 st.rerun()
             except Exception as exc:
@@ -410,7 +444,6 @@ def render_manage_records(records_df: pd.DataFrame) -> None:
                 delete_record(selected_entry_id)
                 st.session_state.pop("delete_record_id", None)
                 st.session_state.pop("selected_record_id", None)
-                clear_records_cache()
                 st.success("Record deleted.")
                 st.rerun()
             except Exception as exc:
@@ -426,7 +459,7 @@ def render_history(records: pd.DataFrame, draw_type: str) -> None:
     filtered = records[records["draw_type"] == draw_type].copy()
     filtered["draw_date"] = filtered["draw_date"].dt.date
     st.dataframe(filtered.head(50), use_container_width=True, hide_index=True)
-    st.caption("The app reads from `data/lotto.db` and exports the current snapshot to `data/normalized_results.csv`.")
+    st.caption(f"The app reads from {storage_backend_label()}.")
 
 
 if __name__ == "__main__":

@@ -51,10 +51,14 @@ class PredictionCandidate:
     total_score: float
     core_score: float
     history_score: float
+    third_digit_score: float
     confidence: str
     support: tuple[str, ...]
     sources: tuple[str, ...]
     best_tier: str
+    recommended_core: tuple[int, int]
+    recommended_third_digit: int
+    third_digit_signals: tuple[str, ...]
 
     @property
     def combo_label(self) -> str:
@@ -272,6 +276,239 @@ def generate_coverage_combos(
     return tuple(sorted(combos))
 
 
+def _candidate_completion_paths(combo: tuple[int, int, int]) -> tuple[tuple[tuple[int, int], int], ...]:
+    digits = list(combo)
+    seen: set[tuple[tuple[int, int], int]] = set()
+    paths: list[tuple[tuple[int, int], int]] = []
+    for first, second in combinations(range(3), 2):
+        third_index = next(index for index in range(3) if index not in {first, second})
+        core = tuple(sorted((digits[first], digits[second])))
+        completion = (core, digits[third_index])
+        if completion in seen:
+            continue
+        seen.add(completion)
+        paths.append(completion)
+    return tuple(paths)
+
+
+def _core_pair_completion_map(analyses: list[WinnerAnalysis]) -> dict[tuple[int, int], dict[int, dict[str, object]]]:
+    completion_map: dict[tuple[int, int], dict[int, dict[str, object]]] = {}
+    tier_weights = {
+        ("latest", "cluster"): 36.0,
+        ("latest", "zone1"): 24.0,
+        ("latest", "zone2"): 12.0,
+        ("previous", "cluster"): 22.0,
+        ("previous", "zone1"): 14.0,
+        ("previous", "zone2"): 8.0,
+    }
+
+    for analysis in analyses:
+        recency_scale = {
+            "latest": 1.0,
+            "previous": 0.72,
+        }.get(analysis.label, 0.46)
+        combos_by_bucket = (
+            ("cluster", analysis.cluster_row_combos),
+            ("zone1", analysis.zone_row_combos_plus_1),
+            ("zone2", analysis.zone_row_combos_plus_2),
+        )
+        for bucket, combos in combos_by_bucket:
+            base_weight = tier_weights.get((analysis.label, bucket), {"cluster": 14.0, "zone1": 9.0, "zone2": 5.0}[bucket])
+            for combo in combos:
+                ordered = tuple(int(digit) for digit in combo)
+                for core, third_digit in _candidate_completion_paths(canonical_combo(ordered)):
+                    completions = completion_map.setdefault(core, {})
+                    payload = completions.setdefault(
+                        third_digit,
+                        {"score": 0.0, "signals": set()},
+                    )
+                    payload["score"] += base_weight * recency_scale
+                    payload["signals"].add(f"{analysis.label}-{bucket}-row")
+
+    return completion_map
+
+
+def _historical_pair_completion_stats(
+    frame: pd.DataFrame,
+    lookback: int = 160,
+) -> dict[tuple[int, int], dict[int, float]]:
+    stats: dict[tuple[int, int], dict[int, float]] = {}
+    sample = frame.head(lookback).reset_index(drop=True)
+
+    for index, number in enumerate(sample["number"]):
+        combo = canonical_combo(int(part) for part in str(number).split("-"))
+        weight = 1.0 / (1.0 + (index * 0.12))
+        for core, third_digit in _candidate_completion_paths(combo):
+            completions = stats.setdefault(core, {})
+            completions[third_digit] = completions.get(third_digit, 0.0) + weight
+
+    return stats
+
+
+def _digit_gap_map(frame: pd.DataFrame, lookback: int = 120) -> dict[int, int]:
+    sample = frame.head(lookback).reset_index(drop=True)
+    gaps = {digit: len(sample) for digit in range(10)}
+
+    for index, number in enumerate(sample["number"]):
+        digits = {int(part) for part in str(number).split("-")}
+        for digit in digits:
+            if gaps[digit] == len(sample):
+                gaps[digit] = index
+
+    return gaps
+
+
+def _recent_digit_frequency(frame: pd.DataFrame, lookback: int = 35) -> dict[int, int]:
+    sample = frame.head(lookback)
+    frequencies = {digit: 0 for digit in range(10)}
+    for number in sample["number"]:
+        for digit in (int(part) for part in str(number).split("-")):
+            frequencies[digit] += 1
+    return frequencies
+
+
+def _pair_affinity_map(frame: pd.DataFrame, lookback: int = 80) -> dict[int, dict[int, float]]:
+    affinity: dict[int, dict[int, float]] = {digit: {} for digit in range(10)}
+    sample = frame.head(lookback).reset_index(drop=True)
+
+    for index, number in enumerate(sample["number"]):
+        unique_digits = sorted({int(part) for part in str(number).split("-")})
+        weight = 1.0 / (1.0 + (index * 0.08))
+        for left, right in combinations(unique_digits, 2):
+            affinity[left][right] = affinity[left].get(right, 0.0) + weight
+            affinity[right][left] = affinity[right].get(left, 0.0) + weight
+
+    return affinity
+
+
+def _score_completion_path(
+    core: tuple[int, int],
+    third_digit: int,
+    combo: tuple[int, int, int],
+    analyses: list[WinnerAnalysis],
+    completion_map: dict[tuple[int, int], dict[int, dict[str, object]]],
+    pair_stats: dict[tuple[int, int], dict[int, float]],
+    digit_gaps: dict[int, int],
+    digit_frequency: dict[int, int],
+    pair_affinity: dict[int, dict[int, float]],
+) -> tuple[float, tuple[str, ...]]:
+    score = 0.0
+    signals: list[str] = []
+    core_set = set(core)
+    latest = analyses[0]
+    previous = analyses[1] if len(analyses) > 1 else None
+
+    row_hits = completion_map.get(core, {}).get(third_digit)
+    if row_hits is not None:
+        score += float(row_hits["score"])
+        signals.extend(sorted(str(signal) for signal in row_hits["signals"]))
+
+    pair_completion = pair_stats.get(core, {})
+    pair_total = sum(pair_completion.values())
+    if pair_total > 0:
+        completion_ratio = pair_completion.get(third_digit, 0.0) / pair_total
+        completion_score = round(completion_ratio * 32.0, 2)
+        if completion_score > 0:
+            score += completion_score
+            signals.append(f"pair-history:{core[0]}-{core[1]}->{third_digit}")
+
+    max_frequency = max(digit_frequency.values()) or 1
+    hot_score = (digit_frequency[third_digit] / max_frequency) * 11.0
+    if hot_score >= 5:
+        score += hot_score
+        signals.append(f"hot-digit:{third_digit}")
+
+    max_gap = max(digit_gaps.values()) or 1
+    overdue_score = (digit_gaps[third_digit] / max_gap) * 9.0
+    if overdue_score >= 4:
+        score += overdue_score
+        signals.append(f"overdue-digit:{third_digit}")
+
+    affinity_left = pair_affinity.get(core[0], {}).get(third_digit, 0.0)
+    affinity_right = pair_affinity.get(core[1], {}).get(third_digit, 0.0)
+    if affinity_left > 0 and affinity_right > 0:
+        pair_affinity_score = min((affinity_left + affinity_right) * 3.2, 14.0)
+        score += pair_affinity_score
+        signals.append(f"pair-affinity:{core[0]}-{core[1]}")
+
+    if third_digit in {pair_of(core[0]), pair_of(core[1])}:
+        score += 8.0
+        signals.append(f"mirror-pair:{third_digit}")
+
+    combo_is_double = len(set(combo)) < 3
+    if combo_is_double:
+        double_pressure = 0.0
+        if latest.is_double:
+            double_pressure += 10.0
+            signals.append("latest-double-carry")
+        if previous and previous.is_double:
+            double_pressure += 5.0
+            signals.append("previous-double-carry")
+        if any(digit in latest.double_pairs_in_zone for digit in combo):
+            double_pressure += 8.0
+            signals.append("latest-double-pair-zone")
+        if previous and any(digit in previous.double_pairs_in_zone for digit in combo):
+            double_pressure += 4.0
+            signals.append("previous-double-pair-zone")
+        score += double_pressure
+
+    latest_pool = set(latest.combined_zone_digits) | set(latest.pair_extended_digits)
+    if third_digit in latest_pool and core_set.issubset(latest_pool):
+        score += 6.0
+        signals.append("latest-zone-completion")
+    if previous:
+        previous_pool = set(previous.combined_zone_digits) | set(previous.pair_extended_digits)
+        if third_digit in previous_pool and core_set.issubset(previous_pool):
+            score += 3.0
+            signals.append("previous-zone-completion")
+
+    return round(score, 2), tuple(dict.fromkeys(signals))
+
+
+def _apply_third_digit_reranker(
+    combined: dict[tuple[int, int, int], dict[str, object]],
+    frame: pd.DataFrame,
+    analyses: list[WinnerAnalysis],
+) -> None:
+    completion_map = _core_pair_completion_map(analyses)
+    pair_stats = _historical_pair_completion_stats(frame.iloc[len(analyses):].reset_index(drop=True))
+    digit_gaps = _digit_gap_map(frame.iloc[len(analyses):].reset_index(drop=True))
+    digit_frequency = _recent_digit_frequency(frame.iloc[len(analyses):].reset_index(drop=True))
+    pair_affinity = _pair_affinity_map(frame.iloc[len(analyses):].reset_index(drop=True))
+
+    for combo, payload in combined.items():
+        best_score = -1.0
+        best_core = combo[:2]
+        best_third_digit = combo[-1]
+        best_signals: tuple[str, ...] = ()
+
+        for core, third_digit in _candidate_completion_paths(combo):
+            score, signals = _score_completion_path(
+                core=core,
+                third_digit=third_digit,
+                combo=combo,
+                analyses=analyses,
+                completion_map=completion_map,
+                pair_stats=pair_stats,
+                digit_gaps=digit_gaps,
+                digit_frequency=digit_frequency,
+                pair_affinity=pair_affinity,
+            )
+            if score > best_score:
+                best_score = score
+                best_core = core
+                best_third_digit = third_digit
+                best_signals = signals
+
+        payload["third_digit_score"] += max(best_score, 0.0)
+        payload["core_score"] += max(best_score, 0.0)
+        payload["third_digit_core"] = best_core
+        payload["third_digit_value"] = best_third_digit
+        payload["third_digit_signals"] = best_signals
+        for signal in best_signals[:3]:
+            payload["supports"].add(f"third-digit:{signal}")
+
+
 def predict_next(
     records: pd.DataFrame,
     draw_type: str,
@@ -294,6 +531,7 @@ def predict_next(
     }
     _apply_overlap_bonus(combined, analyses)
     _apply_history_tiebreaker(combined, frame.iloc[winners_to_use : winners_to_use + history_depth])
+    _apply_third_digit_reranker(combined, frame, analyses)
 
     candidates = [
         PredictionCandidate(
@@ -301,10 +539,14 @@ def predict_next(
             total_score=round(payload["core_score"] + payload["history_score"], 2),
             core_score=round(payload["core_score"], 2),
             history_score=round(payload["history_score"], 2),
+            third_digit_score=round(float(payload["third_digit_score"]), 2),
             confidence=_confidence_from_score(float(payload["core_score"] + payload["history_score"])),
             support=tuple(sorted(payload["supports"])),
             sources=tuple(sorted(payload["sources"])),
             best_tier=min(payload["tiers"], key=lambda item: TIER_PRIORITY[item]),
+            recommended_core=tuple(int(digit) for digit in payload["third_digit_core"]),
+            recommended_third_digit=int(payload["third_digit_value"]),
+            third_digit_signals=tuple(sorted(payload["third_digit_signals"])),
         )
         for combo, payload in combined.items()
     ]
@@ -351,9 +593,13 @@ def _combine_core_scores(analyses: list[WinnerAnalysis]) -> dict[tuple[int, int,
                 {
                     "core_score": 0.0,
                     "history_score": 0.0,
+                    "third_digit_score": 0.0,
                     "supports": set(),
                     "sources": set(),
                     "tiers": set(),
+                    "third_digit_core": None,
+                    "third_digit_value": None,
+                    "third_digit_signals": tuple(),
                 },
             )
             current["core_score"] += float(payload["core_score"])

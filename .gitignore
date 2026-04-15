@@ -1,0 +1,15 @@
+__pycache__/
+*.pyc
+*.pyo
+
+# Local database
+data/lotto.db
+
+# Streamlit secrets (never commit real secrets)
+.streamlit/secrets.toml
+
+# Analysis / scratch
+analysis/
+docs/
+scripts/
+.codex
