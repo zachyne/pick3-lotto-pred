@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 from datetime import date
+import logging
 
 import pandas as pd
 import streamlit as st
 
 from lotto_app.data import (
+    DatabaseConnectionError,
     append_record,
     delete_record,
     list_records,
@@ -15,6 +17,8 @@ from lotto_app.data import (
 )
 from lotto_app.model import grid_table, predict_next
 
+
+LOGGER = logging.getLogger(__name__)
 
 st.set_page_config(page_title="ANY 3 Predictor", page_icon="🔢", layout="wide")
 
@@ -68,7 +72,18 @@ def main() -> None:
         "history only as a tiebreaker."
     )
 
-    records = get_records()
+    try:
+        records = get_records()
+    except DatabaseConnectionError as exc:
+        LOGGER.exception("Database connection failed while loading draw records")
+        st.error(str(exc))
+        st.info(
+            "On Streamlit Cloud, open Manage app -> Settings -> Secrets and verify the "
+            "connection string. If you do not want to use Postgres, remove DATABASE_URL "
+            "and POSTGRES_URL so the app falls back to the bundled SQLite database."
+        )
+        return
+
     if records.empty:
         st.error("No draw records were loaded.")
         return

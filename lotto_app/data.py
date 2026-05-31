@@ -9,6 +9,7 @@ import re
 import sqlite3
 
 import pandas as pd
+from psycopg import OperationalError
 from psycopg import connect as pg_connect
 from psycopg.rows import dict_row
 
@@ -37,6 +38,11 @@ def _load_database_url() -> str | None:
 
 
 DATABASE_URL = _load_database_url()
+_DB_INITIALIZED = False
+
+
+class DatabaseConnectionError(RuntimeError):
+    """Raised when the configured Postgres database cannot be reached."""
 
 
 @dataclass(frozen=True)
@@ -78,7 +84,20 @@ def _sqlite_connect() -> sqlite3.Connection:
 
 
 def _postgres_connect():
-    conn = pg_connect(DATABASE_URL, row_factory=dict_row)
+    try:
+        conn = pg_connect(
+            DATABASE_URL,
+            row_factory=dict_row,
+            connect_timeout=10,
+            application_name="pick3_lotto_pred",
+        )
+    except OperationalError as exc:
+        raise DatabaseConnectionError(
+            "Unable to connect to the configured Postgres database. "
+            "Check that DATABASE_URL or POSTGRES_URL is present in Streamlit secrets, "
+            "the database is running and accepts external connections, credentials are current, "
+            "and the URL includes any provider-required options such as sslmode=require."
+        ) from exc
     conn.autocommit = False
     return conn
 
@@ -140,6 +159,14 @@ def _init_db() -> None:
         conn.execute("DROP TABLE IF EXISTS custom_records")
         conn.commit()
     _sync_normalized_csv_to_db()
+
+
+def ensure_db_initialized() -> None:
+    global _DB_INITIALIZED
+    if _DB_INITIALIZED:
+        return
+    _init_db()
+    _DB_INITIALIZED = True
 
 
 def _sync_normalized_csv_to_db() -> None:
@@ -230,6 +257,7 @@ def _records_from_frame(frame: pd.DataFrame) -> list[DrawRecord]:
 # ---------------------------------------------------------------------------
 
 def load_all_records() -> pd.DataFrame:
+    ensure_db_initialized()
     DATA_DIR.mkdir(exist_ok=True)
 
     records = _load_draw_records()
@@ -279,6 +307,7 @@ def append_record(
     winning_number: str,
     draw_number: int | None = None,
 ) -> DrawRecord:
+    ensure_db_initialized()
     normalized_type = draw_type.strip().lower()
     if normalized_type not in DRAW_TYPES:
         raise ValueError("Draw type must be either midday or evening.")
@@ -333,6 +362,7 @@ def append_record(
 
 
 def list_records() -> pd.DataFrame:
+    ensure_db_initialized()
     with _connect() as conn:
         rows = conn.execute(
             "SELECT id, draw_type, draw_date, draw_number, digit1, digit2, digit3, source "
@@ -365,6 +395,7 @@ def update_record(
     winning_number: str,
     draw_number: int | None = None,
 ) -> DrawRecord:
+    ensure_db_initialized()
     normalized_type = draw_type.strip().lower()
     if normalized_type not in DRAW_TYPES:
         raise ValueError("Draw type must be either midday or evening.")
@@ -442,6 +473,7 @@ def update_record(
 
 
 def delete_record(entry_id: int) -> None:
+    ensure_db_initialized()
     with _connect() as conn:
         existing = conn.execute(
             f"SELECT id FROM draw_records WHERE id = {_placeholder(1)}",
@@ -463,7 +495,3 @@ def _record_equals(left: DrawRecord, right: DrawRecord) -> bool:
         and left.draw_number == right.draw_number
         and left.digits == right.digits
     )
-
-
-# Initialize DB on import.
-_init_db()
